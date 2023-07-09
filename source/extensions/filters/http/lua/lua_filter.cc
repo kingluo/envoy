@@ -189,7 +189,7 @@ Http::AsyncClient::Request* makeHttpCall(lua_State* state, Filter& filter,
 } // namespace
 
 PerLuaCodeSetup::PerLuaCodeSetup(const std::string& lua_code, ThreadLocal::SlotAllocator& tls)
-    : lua_state_(lua_code, tls) {
+    : lua_state_(lua_code, tls), ffiCallbackCtx_(tls) {
   lua_state_.registerType<Filters::Common::Lua::BufferWrapper>();
   lua_state_.registerType<Filters::Common::Lua::MetadataMapWrapper>();
   lua_state_.registerType<Filters::Common::Lua::MetadataMapIterator>();
@@ -238,14 +238,56 @@ StreamHandleWrapper::StreamHandleWrapper(Filters::Common::Lua::Coroutine& corout
       }),
       time_source_(time_source) {}
 
-Http::FilterHeadersStatus StreamHandleWrapper::start(int function_ref) {
+void StreamHandleWrapper::onFFICallback(ffi_task_ctx_t* ffi_ctx) {
+  ASSERT(state_ == State::FFICall);
+  ffiTaskCtx = NULL;
+  lua_State* L = coroutine_.luaState();
+
+  lua_pushboolean(L, ffi_ctx->rc ? 0 : 1);
+
+  if (ffi_ctx->rc) {
+    lua_pushinteger(L, ffi_ctx->rc);
+  }
+
+  if (ffi_ctx->rsp) {
+    if (ffi_ctx->rsp_len) {
+      lua_pushlstring(L, ffi_ctx->rsp, ffi_ctx->rsp_len);
+    } else {
+      lua_pushstring(L, ffi_ctx->rsp);
+    }
+  } else {
+    lua_pushnil(L);
+  }
+
+  if (!ffi_ctx->rc) {
+    lua_pushnil(L);
+  }
+
+  state_ = State::Running;
+  markLive();
+
+  try {
+    resumeCoroutine(3, yield_callback_);
+    markDead();
+  } catch (const Filters::Common::Lua::LuaException& e) {
+    filter_.scriptError(e);
+  }
+
+  if (state_ == State::Running) {
+    headers_continued_ = true;
+    callbacks_.continueIteration();
+  }
+}
+Http::FilterHeadersStatus StreamHandleWrapper::start(int function_ref, FFICallbackCtx* ctx) {
+  ffiCallbackCtx = ctx;
   // We are on the top of the stack.
   coroutine_.start(function_ref, 1, yield_callback_);
-  Http::FilterHeadersStatus status =
-      (state_ == State::WaitForBody || state_ == State::HttpCall || state_ == State::Responded)
-          ? Http::FilterHeadersStatus::StopIteration
-          : Http::FilterHeadersStatus::Continue;
+  Http::FilterHeadersStatus status = (state_ == State::WaitForBody || state_ == State::FFICall ||
+                                      state_ == State::HttpCall || state_ == State::Responded)
+                                         ? Http::FilterHeadersStatus::StopIteration
+                                         : Http::FilterHeadersStatus::Continue;
 
+  printf("status=%d\n", status);
   if (status == Http::FilterHeadersStatus::Continue) {
     headers_continued_ = true;
   }
@@ -275,7 +317,7 @@ Http::FilterDataStatus StreamHandleWrapper::onData(Buffer::Instance& data, bool 
     resumeCoroutine(0, yield_callback_);
   }
 
-  if (state_ == State::HttpCall || state_ == State::WaitForBody) {
+  if (state_ == State::FFICall || state_ == State::HttpCall || state_ == State::WaitForBody) {
     ENVOY_LOG(trace, "buffering body");
     return Http::FilterDataStatus::StopIterationAndBuffer;
   } else if (state_ == State::Responded) {
@@ -307,9 +349,10 @@ Http::FilterTrailersStatus StreamHandleWrapper::onTrailers(Http::HeaderMap& trai
     resumeCoroutine(luaTrailers(coroutine_.luaState()), yield_callback_);
   }
 
-  Http::FilterTrailersStatus status = (state_ == State::HttpCall || state_ == State::Responded)
-                                          ? Http::FilterTrailersStatus::StopIteration
-                                          : Http::FilterTrailersStatus::Continue;
+  Http::FilterTrailersStatus status =
+      (state_ == State::FFICall || state_ == State::HttpCall || state_ == State::Responded)
+          ? Http::FilterTrailersStatus::StopIteration
+          : Http::FilterTrailersStatus::Continue;
 
   if (status == Http::FilterTrailersStatus::Continue) {
     headers_continued_ = true;
@@ -796,6 +839,10 @@ StreamHandleWrapper::getTimestampResolution(absl::string_view unit_parameter) {
   }
   return resolution;
 }
+int StreamHandleWrapper::ffiYield(lua_State* state) {
+  state_ = State::FFICall;
+  return lua_yield(state, 0);
+}
 
 FilterConfig::FilterConfig(const envoy::extensions::filters::http::lua::v3::Lua& proto_config,
                            ThreadLocal::SlotAllocator& tls,
@@ -865,11 +912,13 @@ Filter::doHeaders(StreamHandleRef& handle, Filters::Common::Lua::CoroutinePtr& c
 
   Http::FilterHeadersStatus status = Http::FilterHeadersStatus::Continue;
   try {
-    status = handle.get()->start(function_ref);
+    status = handle.get()->start(function_ref, setup->ffiCallbackCtx());
     handle.markDead();
   } catch (const Filters::Common::Lua::LuaException& e) {
+    std::cerr << e.what() << std::endl;
     scriptError(e);
   }
+  printf("*** status=%d\n", status);
 
   return status;
 }
@@ -969,6 +1018,184 @@ void Filter::EncoderCallbacks::respond(Http::ResponseHeaderMapPtr&&, Buffer::Ins
 
 const ProtobufWkt::Struct& Filter::EncoderCallbacks::metadata() const {
   return getMetadata(callbacks_);
+}
+
+extern "C" {
+static ngx_thread_task_t* ngx_http_lua_ffi_task_alloc(size_t size) {
+  ngx_thread_task_t* task;
+
+  task = static_cast<ngx_thread_task_t*>(calloc(sizeof(ngx_thread_task_t) + size, 1));
+  if (task == NULL) {
+    return NULL;
+  }
+
+  task->ctx = task + 1;
+
+  return task;
+}
+
+void* ngx_http_lua_ffi_create_task_queue(int max_queue) {
+  ffi_task_queue_t* tp = static_cast<ffi_task_queue_t*>(calloc(sizeof(ffi_task_queue_t), 1));
+
+  ngx_task_queue_init(&tp->queue);
+
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+  pthread_mutex_init(&tp->mtx, &attr);
+  pthread_mutexattr_destroy(&attr);
+
+  pthread_cond_init(&tp->cond, NULL);
+
+  tp->max_queue = max_queue;
+
+  return tp;
+}
+
+static void ngx_http_lua_ffi_free_task_queue(ffi_task_queue_t* tp) {
+  /*
+   * After special finished task, no new task post (ensured by lua land),
+   * and all pending tasks are handled, so no tasks in the queue now.
+   */
+  pthread_mutex_destroy(&tp->mtx);
+  pthread_cond_destroy(&tp->cond);
+  free(tp);
+}
+
+static ngx_int_t ngx_task_post(ffi_task_queue_t* tp, ngx_thread_task_t* task) {
+  if (pthread_mutex_lock(&tp->mtx) != 0) {
+    return -1;
+  }
+
+  if (task->ctx && tp->waiting >= tp->max_queue) {
+    (void)pthread_mutex_unlock(&tp->mtx);
+    return -1;
+  }
+
+  task->next = NULL;
+
+  if (pthread_cond_signal(&tp->cond) != 0) {
+    (void)pthread_mutex_unlock(&tp->mtx);
+    return -1;
+  }
+
+  *tp->queue.last = task;
+  tp->queue.last = &task->next;
+
+  tp->waiting++;
+
+  (void)pthread_mutex_unlock(&tp->mtx);
+
+  return 0;
+}
+
+int ngx_http_lua_ffi_task_post(void* p0, void* p, char* req, int req_len) {
+  ffi_task_queue_t* tp = static_cast<ffi_task_queue_t*>(p);
+  ngx_thread_task_t* task = ngx_http_lua_ffi_task_alloc(sizeof(ffi_task_ctx_t));
+  ffi_task_ctx_t* ctx = static_cast<ffi_task_ctx_t*>(task->ctx);
+
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+  pthread_mutex_init(&ctx->mtx, &attr);
+  pthread_mutexattr_destroy(&attr);
+
+  ctx->is_abort = false;
+  ctx->req = req;
+  ctx->req_len = req_len;
+
+  StreamHandleWrapper* r = static_cast<StreamHandleWrapper*>(p0);
+  r->ffiPost(ctx);
+
+  if (ngx_task_post(tp, task) != 0) {
+    ngx_http_lua_ffi_task_free(ctx);
+    return -1;
+  }
+
+  return 0;
+}
+
+int ngx_http_lua_ffi_task_finish(void* p) {
+  ffi_task_queue_t* tp = static_cast<ffi_task_queue_t*>(p);
+
+  ngx_thread_task_t* task = static_cast<ngx_thread_task_t*>(calloc(sizeof(ngx_thread_task_t), 1));
+
+  /* append, so that all pending tasks get handled before finished */
+  if (ngx_task_post(tp, task) != 0) {
+    free(task);
+    return -1;
+  }
+
+  return 0;
+}
+
+void* ngx_http_lua_ffi_task_poll(void* p) {
+  ffi_task_queue_t* tp = static_cast<ffi_task_queue_t*>(p);
+  ngx_thread_task_t* task = NULL;
+  if (pthread_mutex_lock(&tp->mtx) != 0) {
+    return NULL;
+  }
+
+  /* the number may become negative */
+  tp->waiting--;
+
+  while (tp->queue.first == NULL) {
+    if (pthread_cond_wait(&tp->cond, &tp->mtx) != 0) {
+      (void)pthread_mutex_unlock(&tp->mtx);
+      return NULL;
+    }
+  }
+
+  task = tp->queue.first;
+  tp->queue.first = task->next;
+
+  if (tp->queue.first == NULL) {
+    tp->queue.last = &tp->queue.first;
+  }
+
+  if (pthread_mutex_unlock(&tp->mtx) != 0) {
+    return NULL;
+  }
+
+  if (task->ctx) {
+    return task;
+  }
+
+  free(task);
+  ngx_http_lua_ffi_free_task_queue(tp);
+  return NULL;
+}
+
+char* ngx_http_lua_ffi_get_req(void* tsk, int* len) {
+  ngx_thread_task_t* task = static_cast<ngx_thread_task_t*>(tsk);
+  ffi_task_ctx_t* ctx = static_cast<ffi_task_ctx_t*>(task->ctx);
+  if (len != NULL) {
+    *len = ctx->req_len;
+  }
+  return ctx->req;
+}
+
+void ngx_http_lua_ffi_respond(void* tsk, int rc, char* rsp, int rsp_len) {
+  ngx_thread_task_t* task = static_cast<ngx_thread_task_t*>(tsk);
+  ffi_task_ctx_t* ctx = static_cast<ffi_task_ctx_t*>(task->ctx);
+  pthread_mutex_lock(&ctx->mtx);
+  printf("is_abort=%d\n", ctx->is_abort);
+  if (!ctx->is_abort) {
+    ctx->rc = rc;
+    ctx->rsp = rsp;
+    ctx->rsp_len = rsp_len;
+    printf("1=======%p\n", &ctx->mtx);
+    static_cast<FFICallbackCtx*>(static_cast<StreamHandleWrapper*>(ctx->wrapper)->ffiCallbackCtx)
+        ->notify(task);
+    printf("2=======%p\n", &ctx->mtx);
+  } else {
+    ngx_http_lua_ffi_task_free(ctx);
+    if (rsp) {
+      free(rsp);
+    }
+  }
+  pthread_mutex_unlock(&ctx->mtx);
+}
 }
 
 } // namespace Lua

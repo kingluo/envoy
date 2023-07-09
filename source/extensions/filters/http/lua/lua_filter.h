@@ -15,24 +15,11 @@
 #include <pthread.h>
 
 extern "C" {
-typedef int ngx_int_t;
 struct ngx_thread_task_s {
   struct ngx_thread_task_s* next;
   void* ctx;
 };
 typedef struct ngx_thread_task_s ngx_thread_task_t;
-
-struct ngx_thread_pool_queue_s {
-  ngx_thread_task_t* first;
-  ngx_thread_task_t** last;
-};
-typedef struct ngx_thread_pool_queue_s ngx_thread_pool_queue_t;
-
-using ThreadQueuePtr = std::unique_ptr<ngx_thread_pool_queue_t>;
-
-#define ngx_thread_pool_queue_init(q)                                                              \
-  (q)->first = NULL;                                                                               \
-  (q)->last = &(q)->first
 
 typedef struct {
   pthread_mutex_t mtx;
@@ -50,16 +37,16 @@ typedef struct {
   ngx_thread_task_t** last;
 } ngx_task_queue_t;
 
-#define ngx_task_queue_init(q)                                                                     \
-  (q)->first = NULL;                                                                               \
+#define ngx_task_queue_init(q) \
+  (q)->first = NULL; \
   (q)->last = &(q)->first
 
 typedef struct {
   pthread_mutex_t mtx;
   ngx_task_queue_t queue;
-  ngx_int_t waiting;
+  int32_t waiting;
   pthread_cond_t cond;
-  ngx_int_t max_queue;
+  int32_t max_queue;
 } ffi_task_queue_t;
 
 inline void ngx_http_lua_ffi_task_free(ffi_task_ctx_t* ctx) {
@@ -79,9 +66,6 @@ namespace Extensions {
 namespace HttpFilters {
 namespace Lua {
 
-class FFICallbackCtx;
-using FFICallbackCtxPtr = std::unique_ptr<FFICallbackCtx>;
-
 /**
  * All lua stats. @see stats_macros.h
  */
@@ -92,23 +76,6 @@ using FFICallbackCtxPtr = std::unique_ptr<FFICallbackCtx>;
  */
 struct LuaFilterStats {
   ALL_LUA_FILTER_STATS(GENERATE_COUNTER_STRUCT)
-};
-
-struct ThreadLocalFFICallbackCtx {
-  ThreadLocalFFICallbackCtx(ThreadLocal::SlotAllocator& tls)
-      : tls_slot_(ThreadLocal::TypedSlot<FFICallbackCtxThreadLocal>::makeUnique(tls)) {
-    // Now initialize on all threads.
-    tls_slot_->set([](Event::Dispatcher& dispatcher) {
-      return std::make_shared<FFICallbackCtxThreadLocal>(dispatcher);
-    });
-  }
-  struct FFICallbackCtxThreadLocal : public ThreadLocal::ThreadLocalObject {
-    FFICallbackCtxThreadLocal(Event::Dispatcher& dispatcher)
-        : ptr_(std::make_unique<FFICallbackCtx>(dispatcher)) {}
-    FFICallbackCtxPtr ptr_;
-  };
-  FFICallbackCtx* tlsCtx() { return (*tls_slot_)->ptr_.get(); }
-  ThreadLocal::TypedSlotPtr<FFICallbackCtxThreadLocal> tls_slot_;
 };
 
 class PerLuaCodeSetup : Logger::Loggable<Logger::Id::lua> {
@@ -124,14 +91,12 @@ public:
 
   uint64_t runtimeBytesUsed() { return lua_state_.runtimeBytesUsed(); }
   void runtimeGC() { return lua_state_.runtimeGC(); }
-  FFICallbackCtx* ffiCallbackCtx() { return ffiCallbackCtx_.tlsCtx(); }
 
 private:
   uint64_t request_function_slot_{};
   uint64_t response_function_slot_{};
 
   Filters::Common::Lua::ThreadLocalState lua_state_;
-  ThreadLocalFFICallbackCtx ffiCallbackCtx_;
 };
 
 using PerLuaCodeSetupPtr = std::unique_ptr<PerLuaCodeSetup>;
@@ -226,6 +191,7 @@ public:
     WaitForTrailers,
     // Lua script is blocked waiting for the result of an HTTP call.
     HttpCall,
+    // Lua script is blocked waiting for the result of an FFI call.
     FFICall,
     // Lua script has done a direct response.
     Responded
@@ -238,6 +204,7 @@ public:
   }
 
   void onFFICallback(ffi_task_ctx_t* ffi_ctx);
+
   struct HttpCallOptions {
     Http::AsyncClient::RequestOptions request_options_;
     bool is_async_request_{false};
@@ -248,7 +215,7 @@ public:
                       Http::RequestOrResponseHeaderMap& headers, bool end_stream, Filter& filter,
                       FilterCallbacks& callbacks, TimeSource& time_source);
 
-  Http::FilterHeadersStatus start(int function_ref, FFICallbackCtx* ctx);
+  Http::FilterHeadersStatus start(int function_ref);
   Http::FilterDataStatus onData(Buffer::Instance& data, bool end_stream);
   Http::FilterTrailersStatus onTrailers(Http::HeaderMap& trailers);
 
@@ -260,7 +227,6 @@ public:
     on_reset_called_ = true;
 
     if (ffiTaskCtx) {
-      printf("set is_abort=true\n");
       auto ctx = static_cast<ffi_task_ctx_t*>(ffiTaskCtx);
       pthread_mutex_lock(&ctx->mtx);
       ctx->is_abort = true;
@@ -289,11 +255,13 @@ public:
             {"base64Escape", static_luaBase64Escape},
             {"timestamp", static_luaTimestamp},
             {"timestampString", static_luaTimestampString},
-            {"ffiYield", static_ffiYield}};
+            {"ffiYield", static_ffiYield},
+            {"this", static_this_fn}};
   }
 
 private:
   DECLARE_LUA_FUNCTION(StreamHandleWrapper, ffiYield);
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, this_fn);
 
   /**
    * Perform an HTTP call to an upstream host.
@@ -474,8 +442,8 @@ private:
   absl::flat_hash_map<std::string, Envoy::Common::Crypto::CryptoObjectPtr> public_key_storage_;
 
 public:
-  FFICallbackCtx* ffiCallbackCtx;
   void* ffiTaskCtx;
+  Event::Dispatcher& dispatcher() { return callbacks_.dispatcher(); }
 };
 
 /**
@@ -731,58 +699,6 @@ private:
   // seems like a safer fix for now.
   Filters::Common::Lua::CoroutinePtr request_coroutine_;
   Filters::Common::Lua::CoroutinePtr response_coroutine_;
-};
-
-class FFICallbackCtx {
-public:
-  FFICallbackCtx(Event::Dispatcher& dispatcher)
-      : queue(std::make_unique<ngx_thread_pool_queue_t>()), lock(PTHREAD_MUTEX_INITIALIZER) {
-    ngx_thread_pool_queue_init(queue.get());
-    evtFd = eventfd(0, 0);
-    printf("evtFd=%d...\n", evtFd);
-    evtPtr = dispatcher.createFileEvent(
-        evtFd,
-        [this](uint32_t events) -> void {
-          ASSERT(events == Event::FileReadyType::Read);
-          ngx_thread_task_t* task;
-
-          pthread_mutex_lock(&lock);
-
-          task = queue->first;
-          queue->first = NULL;
-          queue->last = &queue->first;
-
-          pthread_mutex_unlock(&lock);
-
-          while (task) {
-            auto ctx = static_cast<ffi_task_ctx_t*>(task->ctx);
-            task = task->next;
-            printf("ok, callback=%p\n", ctx);
-            if (!ctx->is_abort) {
-              static_cast<StreamHandleWrapper*>(ctx->wrapper)->onFFICallback(ctx);
-            }
-            ngx_http_lua_ffi_task_free(ctx);
-          }
-        },
-        Event::FileTriggerType::Edge, Event::FileReadyType::Read);
-    printf("evtFd=%p...\n", evtPtr.get());
-  }
-  Event::FileEventPtr evtPtr;
-  int evtFd;
-  ThreadQueuePtr queue;
-  pthread_mutex_t lock;
-  void notify(ngx_thread_task_t* task) {
-    task->next = NULL;
-    std::cout << "hello" << std::endl;
-    pthread_mutex_lock(&lock);
-    std::cout << "world" << std::endl;
-    *((*queue).last) = task;
-    (*queue).last = &task->next;
-    pthread_mutex_unlock(&lock);
-    uint64_t inc = 1;
-    int sz = write(evtFd, &inc, sizeof(uint64_t));
-    printf("sz=%d\n", sz);
-  }
 };
 
 } // namespace Lua

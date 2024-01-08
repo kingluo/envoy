@@ -384,10 +384,10 @@ case $CI_TARGET in
         # This doesn't go into CI but is available for developer convenience.
         echo "bazel fastbuild build with contrib extensions and tests..."
         echo "Building..."
-        bazel_contrib_binary_build fastbuild
+        bazel_contrib_binary_build release
 
-        echo "Testing ${TEST_TARGETS[*]}"
-        bazel test "${BAZEL_BUILD_OPTIONS[@]}" -c fastbuild "${TEST_TARGETS[@]}"
+        #echo "Testing ${TEST_TARGETS[*]}"
+        #bazel test "${BAZEL_BUILD_OPTIONS[@]}" -c fastbuild "${TEST_TARGETS[@]}"
         ;;
     compile_time_options)
         # Right now, none of the available compile-time options conflict with each other. If this

@@ -225,9 +225,9 @@ case $CI_TARGET in
         ENVOY_BINARY_DIR="${ENVOY_BUILD_DIR}/bin"
         mkdir -p "$ENVOY_BINARY_DIR"
 
-        ## Run release tests
-        ##echo "Testing ${TEST_TARGETS[*]} with options: ${BAZEL_BUILD_OPTIONS[*]}"
-        #bazel_with_collection test "${BAZEL_BUILD_OPTIONS[@]}" --remote_download_minimal -c opt "${TEST_TARGETS[@]}"
+        # Run release tests
+        echo "Testing ${TEST_TARGETS[*]} with options: ${BAZEL_BUILD_OPTIONS[*]}"
+        bazel_with_collection test "${BAZEL_BUILD_OPTIONS[@]}" --remote_download_minimal -c opt "${TEST_TARGETS[@]}"
 
         # Build release binaries
         # As the binary build package enforces `-c opt`, adding here to ensure the distribution build reuses
